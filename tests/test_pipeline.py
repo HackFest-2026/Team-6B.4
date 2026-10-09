@@ -55,8 +55,8 @@ class PipelineTests(unittest.TestCase):
                     "race": ["Caucasian", "AfricanAmerican", "Asian"][patient % 3],
                     "gender": "Female" if patient % 2 else "Male",
                     "age": ["[40-50)", "[60-70)", "[70-80)"][patient % 3],
-                    "admission_type": ["Emergency", "Elective"][encounter % 2],
-                    "admission_source": "Emergency Room",
+                    "admission_type_id": ["Emergency", "Elective"][encounter % 2],
+                    "admission_source_id": "Emergency Room",
                     "time_in_hospital": 1 + (patient + encounter) % 9,
                     "number_inpatient": inpatient,
                     "number_emergency": (patient + encounter) % 3,
@@ -73,18 +73,28 @@ class PipelineTests(unittest.TestCase):
             source = root / "synthetic.csv"
             pd.DataFrame(rows).to_csv(source, index=False)
             result = train(source, root / "artifacts")
-            self.assertIn(result["selected_model"], {"Logistic Regression (balanced)", "Logistic Regression", "Random Forest", "Extra Trees", "Gradient Boosting"})
+            self.assertIn(result["selected_model"], {"Logistic Regression (balanced)", "Logistic Regression", "Random Forest", "Gradient Boosting"})
             self.assertIn("selected_test_metrics", result)
             self.assertTrue((root / "artifacts" / "medvision_pipeline.joblib").exists())
             self.assertTrue((root / "artifacts" / "historical_predictions.csv").exists())
             self.assertTrue((root / "artifacts" / "fairness_metrics.csv").exists())
+            self.assertTrue((root / "artifacts" / "compact_historical_predictions.csv").exists())
+            self.assertTrue((root / "artifacts" / "compact_fairness_metrics.csv").exists())
             import joblib
             bundle = joblib.load(root / "artifacts" / "medvision_pipeline.joblib")
-            new_row = {column: np.nan for column in bundle["feature_columns"]}
+            self.assertIn("compact_pipeline", bundle)
+            self.assertEqual(set(bundle["compact_feature_columns"]), {
+                "age", "gender", "race", "admission_type_id", "admission_source_id",
+                "time_in_hospital", "number_inpatient", "number_emergency",
+                "number_outpatient", "number_diagnoses", "num_medications", "a1cresult", "insulin",
+            })
+            new_row = {column: np.nan for column in bundle["compact_feature_columns"]}
             new_row.update({"age": "[60-70)", "gender": "Female", "race": "Caucasian", "time_in_hospital": 4, "number_inpatient": 1, "number_emergency": 0, "number_outpatient": 0, "number_diagnoses": 6, "num_medications": 12, "diag_1": "250.83"})
-            features = prepare_features(pd.DataFrame([new_row]), bundle["feature_columns"])
-            risk = bundle["pipeline"].predict_proba(features)[0, 1]
+            features = prepare_features(pd.DataFrame([new_row]), bundle["compact_feature_columns"])
+            risk = bundle["compact_pipeline"].predict_proba(features)[0, 1]
             self.assertTrue(0 <= risk <= 1)
+            self.assertIn("average_precision", result["selected_test_metrics"])
+            self.assertIn("balanced_accuracy", result["selected_test_metrics"])
 
 
 if __name__ == "__main__":

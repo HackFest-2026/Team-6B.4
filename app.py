@@ -69,13 +69,17 @@ baseline = bundle.get("explanation_baseline", {})
 threshold = float(bundle.get("threshold", 0.5))
 metrics = json.loads((ARTIFACTS / "metrics.json").read_text(encoding="utf-8"))
 historical = pd.read_csv(ARTIFACTS / "historical_predictions.csv")
+compact_history_path = ARTIFACTS / "compact_historical_predictions.csv"
+compact_historical = pd.read_csv(compact_history_path) if compact_history_path.exists() else historical.copy()
 
 for field, mapping in mappings.items():
-    if field in historical:
-        historical[field] = historical[field].map(lambda value: mapping.get(str(value), str(value)) if pd.notna(value) else "Unknown")
-for column in ("age", "gender", "race", "diabetesmed", "insulin"):
-    if column in historical:
-        historical[column] = historical[column].fillna("Unknown").astype(str)
+    for frame in (historical, compact_historical):
+        if field in frame:
+            frame[field] = frame[field].map(lambda value: mapping.get(str(value), str(value)) if pd.notna(value) else "Unknown")
+for frame in (historical, compact_historical):
+    for column in ("age", "gender", "race", "diabetesmed", "insulin"):
+        if column in frame:
+            frame[column] = frame[column].fillna("Unknown").astype(str)
 overall_actual = float(historical["actual_readmitted_within_30_days"].mean())
 overall_prediction = historical["predicted_readmitted_within_30_days"].to_numpy(dtype=int)
 overall_truth = historical["actual_readmitted_within_30_days"].to_numpy(dtype=int)
@@ -98,15 +102,19 @@ def group_statistics(frame: pd.DataFrame):
     }
 
 
-def render_fairness(profile: dict, key_prefix: str):
+def render_fairness(profile: dict, key_prefix: str, peer_frame: pd.DataFrame | None = None):
+    cohort = peer_frame if peer_frame is not None else historical
     st.subheader("Fairness context")
-    st.caption("Aggregate holdout outcomes for people in similar demographic groups, compared with the full holdout.")
-    overall = group_statistics(historical)
+    if key_prefix == "new":
+        st.caption("Aggregate outcomes for similar demographic groups in this compact model's holdout. This is group context, not the new encounter's outcome.")
+    else:
+        st.caption("Aggregate holdout outcomes for people in similar demographic groups, compared with the full holdout.")
+    overall = group_statistics(cohort)
     dimensions = [("age", "Age band"), ("gender", "Gender"), ("race", "Race")]
     cards = st.columns(3)
     for col, (attribute, title) in zip(cards, dimensions):
         value = str(profile.get(attribute, "Unknown"))
-        peers = historical[historical[attribute].fillna("Unknown").astype(str) == value]
+        peers = cohort[cohort[attribute].fillna("Unknown").astype(str) == value]
         stats = group_statistics(peers)
         with col:
             with st.container(border=True):
@@ -136,29 +144,33 @@ def format_feature_name(name: str) -> str:
     return name.replace("_", " ").capitalize()
 
 
-def explain_estimate(raw_record, input_name: str):
+def explain_estimate(raw_record, input_name: str, model=None, columns=None, typical_values=None, decision_cutoff=None):
+    scorer = model or pipeline
+    active_columns = columns or feature_columns
+    active_baseline = typical_values or baseline
+    cutoff = threshold if decision_cutoff is None else float(decision_cutoff)
     raw_frame = pd.DataFrame([raw_record])
-    features = prepare_features(raw_frame, feature_columns, mappings)
-    risk = float(pipeline.predict_proba(features)[0, 1])
+    features = prepare_features(raw_frame, active_columns, mappings)
+    risk = float(scorer.predict_proba(features)[0, 1])
     st.subheader("How this estimate was formed")
     st.caption("One-field comparisons against the training-set typical value. These are learned associations, not causes.")
     changes = []
-    for feature in feature_columns:
-        typical = baseline.get(feature)
+    for feature in active_columns:
+        typical = active_baseline.get(feature)
         current = features.iloc[0][feature]
         if typical is None or pd.isna(current) or str(current) == str(typical):
             continue
         counterfactual = features.copy()
         counterfactual.loc[counterfactual.index[0], feature] = typical
-        alternative = float(pipeline.predict_proba(counterfactual)[0, 1])
+        alternative = float(scorer.predict_proba(counterfactual)[0, 1])
         changes.append((risk - alternative, feature))
     increases = sorted((item for item in changes if item[0] > 0.001), reverse=True)[:3]
     decreases = sorted((item for item in changes if item[0] < -0.001))[:3]
     with st.container(border=True):
         result_col, explain_col = st.columns([.8, 1.7])
         with result_col:
-            level = "Higher" if risk >= .7 else "Moderate" if risk >= .3 else "Lower"
-            st.metric("Estimated 30-day readmission risk", f"{risk:.1%}", level)
+            level = "Above model cutoff" if risk >= cutoff else "Below model cutoff"
+            st.metric("Estimated 30-day readmission risk", f"{risk:.1%}", level, help=f"Validation-selected cutoff: {cutoff:.1%}")
             st.progress(min(max(risk, 0.0), 1.0))
         with explain_col:
             factor_cols = st.columns(2)
@@ -168,7 +180,7 @@ def explain_estimate(raw_record, input_name: str):
             with factor_cols[1]:
                 st.markdown("**Signals lowering the estimate**")
                 st.write("\n".join(f"• {format_feature_name(name)}" for _, name in decreases) if decreases else "No strong downward signal among entered fields.")
-            st.caption("The compact form leaves some model inputs to training-fitted imputation.")
+            st.caption("Contributions are one-field comparisons to training-set typical values; they are associations, not causes.")
     return risk, features
 
 
@@ -178,32 +190,44 @@ if page == "Home":
     st.subheader("Model breakthrough results")
     selected_metrics = metrics["selected_test_metrics"]
     st.caption(f"{metrics['selected_model']} · decision cutoff {threshold:.2f} · untouched patient-level test set ({metrics['test_rows']:,} encounters)")
-    cards = st.columns(5)
+    cards = st.columns(6)
     for col, (label, name, note) in zip(cards, [
         ("Accuracy", "accuracy", "Correct classifications"), ("Precision", "precision", "Positive predictions that were correct"),
-        ("Recall", "recall", "Positive cases found"), ("F1 score", "f1", "Precision/recall balance"), ("AUC", "auc", "Ranking quality across cutoffs")]):
+        ("Recall", "recall", "Positive cases found"), ("F1 score", "f1", "Precision/recall balance"),
+        ("Avg. precision", "average_precision", "Precision-recall quality"), ("ROC-AUC", "auc", "Ranking quality across cutoffs")]):
         with col:
             value = selected_metrics[name]
             st.markdown(f'<div class="metric-card"><div class="metric-label">{label}</div><div class="metric-value">{value:.1%}</div><div class="metric-note">{note}</div></div>', unsafe_allow_html=True)
     target_col, baseline_col, target_note = st.columns([1.15, 1.15, 2])
-    target_col.markdown("**90% accuracy goal**")
-    target_col.caption("Reached" if selected_metrics["accuracy"] >= .9 else "Not reached")
-    baseline_col.markdown("**Always-negative baseline**")
-    baseline_col.caption(f"{metrics['test_majority_baseline_accuracy']:.1%}")
-    target_note.caption(f"Positive cases are {metrics['test_positive_rate']:.1%} of the test set. Model choice used validation AUC; the displayed cutoff was selected on validation for F1.")
+    target_col.markdown("**Readmission prevalence**")
+    target_col.caption(f"{metrics['test_positive_rate']:.1%} of holdout encounters")
+    baseline_col.markdown("**Always-negative accuracy**")
+    baseline_col.caption(f"{metrics['test_majority_baseline_accuracy']:.1%} · accuracy alone can hide missed cases")
+    target_note.caption(f"Model selection used validation average precision; the displayed decision cutoff was selected on validation using F2 to weight recall. Holdout patients were not used for tuning.")
+    f1_tradeoff = metrics.get("selected_test_metrics_at_f1_threshold")
+    if f1_tradeoff:
+        st.caption(f"Threshold trade-off on the same holdout (F1-selected validation cutoff {metrics['decision_threshold_f1_alternative']:.2f}): precision {f1_tradeoff['precision']:.1%}, recall {f1_tradeoff['recall']:.1%}, accuracy {f1_tradeoff['accuracy']:.1%}. The active F2 cutoff favors finding more positive cases and creates more false alerts.")
 
     st.subheader("Model comparison")
     comparison = metrics["validation_metrics_at_0_5"]
     names = list(comparison)
     compare = go.Figure()
     compare.add_trace(go.Bar(name="Accuracy", y=names, x=[comparison[n]["accuracy"] for n in names], orientation="h", marker_color="#83cba6"))
-    compare.add_trace(go.Bar(name="AUC", y=names, x=[comparison[n]["auc"] for n in names], orientation="h", marker_color="#08764e"))
+    compare.add_trace(go.Bar(name="ROC-AUC", y=names, x=[comparison[n]["auc"] for n in names], orientation="h", marker_color="#08764e"))
+    compare.add_trace(go.Bar(name="Average precision", y=names, x=[comparison[n]["average_precision"] for n in names], orientation="h", marker_color="#e0aa3e"))
     compare.update_layout(template="plotly_white", barmode="group", height=360, margin={"l":12,"r":20,"t":42,"b":24},
                           xaxis={"range":[0,1],"tickformat":".0%","tickfont":{"color":"#18372c"},"gridcolor":"#e2ece5"},
                           yaxis={"autorange":"reversed","tickfont":{"color":"#18372c","size":12},"automargin":True},
                           paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font={"family":"Segoe UI","color":"#18372c"},
                           legend={"orientation":"h","y":1.12,"font":{"color":"#18372c"}})
     st.plotly_chart(compare, width="stretch", config={"displayModeBar":False})
+    compact_result = metrics.get("compact_form_model")
+    if compact_result:
+        compact_metrics = compact_result["selected_test_metrics"]
+        with st.container(border=True):
+            st.markdown("**New data form model · patient-level holdout**")
+            st.caption(f"{compact_result['selected_model']} · trained on the {len(compact_result['features'])} fields in the form · validation F2 cutoff {compact_result['decision_threshold']:.2f}")
+            st.write(f"Recall **{compact_metrics['recall']:.1%}** · precision **{compact_metrics['precision']:.1%}** · average precision **{compact_metrics['average_precision']:.3f}** · ROC-AUC **{compact_metrics['auc']:.3f}**")
 
     st.subheader("Holdout distribution")
     chart_col, detail_col = st.columns([1, 1.15], gap="large")
@@ -283,13 +307,21 @@ else:
             outpatient = c1.number_input("Prior outpatient visits",min_value=0,max_value=100,value=0,step=1)
             diagnoses = c2.number_input("Number of diagnoses",min_value=1,max_value=20,value=5,step=1)
             medications = c3.number_input("Number of medications",min_value=0,max_value=100,value=10,step=1)
-            a1c = c4.selectbox("A1C result",["Unknown","None","Norm",">7",">8"])
+            a1c = c4.selectbox("A1C result",["Unknown","Norm",">7",">8"])
             insulin = st.selectbox("Insulin",["No","Steady","Up","Down"])
             submitted = st.form_submit_button("Estimate readmission risk",type="primary")
     if submitted:
-        patient = {column:np.nan for column in feature_columns}
+        compact_columns = bundle.get("compact_feature_columns", feature_columns)
+        patient = {column:np.nan for column in compact_columns}
         patient.update({"age":age,"gender":gender,"race":race,"admission_type_id":admission_type,"admission_source_id":admission_source,
                         "time_in_hospital":duration,"number_inpatient":inpatient,"number_emergency":emergency,"number_outpatient":outpatient,
                         "number_diagnoses":diagnoses,"num_medications":medications,"a1cresult":a1c,"insulin":insulin})
-        risk, features = explain_estimate(patient,"new")
-        render_fairness({"age":age,"gender":gender,"race":race},"new")
+        risk, features = explain_estimate(
+            patient,
+            "new",
+            model=bundle.get("compact_pipeline", pipeline),
+            columns=compact_columns,
+            typical_values=bundle.get("compact_explanation_baseline", baseline),
+            decision_cutoff=bundle.get("compact_threshold", threshold),
+        )
+        render_fairness({"age":age,"gender":gender,"race":race},"new",peer_frame=compact_historical)
