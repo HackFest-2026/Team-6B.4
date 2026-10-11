@@ -150,6 +150,17 @@ def format_feature_name(name: str) -> str:
     return name.replace("_", " ").capitalize()
 
 
+def format_feature_value(value) -> str:
+    if pd.isna(value):
+        return "Unknown"
+    if isinstance(value, (np.integer, int)):
+        return str(int(value))
+    if isinstance(value, (np.floating, float)):
+        numeric = float(value)
+        return str(int(numeric)) if numeric.is_integer() else f"{numeric:.1f}"
+    return str(value)
+
+
 def explain_estimate(raw_record, input_name: str, model=None, columns=None, typical_values=None, decision_cutoff=None):
     scorer = model or pipeline
     active_columns = columns or feature_columns
@@ -169,9 +180,29 @@ def explain_estimate(raw_record, input_name: str, model=None, columns=None, typi
         counterfactual = features.copy()
         counterfactual.loc[counterfactual.index[0], feature] = typical
         alternative = float(scorer.predict_proba(counterfactual)[0, 1])
-        changes.append((risk - alternative, feature))
-    increases = sorted((item for item in changes if item[0] > 0.001), reverse=True)[:3]
-    decreases = sorted((item for item in changes if item[0] < -0.001))[:3]
+        changes.append({
+            "delta": risk - alternative,
+            "feature": feature,
+            "current": current,
+            "typical": typical,
+        })
+    increases = sorted(
+        (item for item in changes if item["delta"] > 0.001),
+        key=lambda item: item["delta"], reverse=True,
+    )[:5]
+    decreases = sorted(
+        (item for item in changes if item["delta"] < -0.001),
+        key=lambda item: item["delta"],
+    )[:5]
+
+    def describe_factor(item):
+        delta_pp = item["delta"] * 100
+        return (
+            f"- **{format_feature_name(item['feature'])}:** {format_feature_value(item['current'])} "
+            f"(training typical: {format_feature_value(item['typical'])}) · "
+            f"one-field comparison: {delta_pp:+.1f} percentage points"
+        )
+
     with st.container(border=True):
         result_col, explain_col = st.columns([.8, 1.7])
         with result_col:
@@ -181,12 +212,12 @@ def explain_estimate(raw_record, input_name: str, model=None, columns=None, typi
         with explain_col:
             factor_cols = st.columns(2)
             with factor_cols[0]:
-                st.markdown("**Signals raising the estimate**")
-                st.write("\n".join(f"• {format_feature_name(name)}" for _, name in increases) if increases else "No strong upward signal among entered fields.")
+                st.markdown("**Factors associated with a higher estimate**")
+                st.markdown("\n".join(describe_factor(item) for item in increases) if increases else "No strong upward signal among entered fields.")
             with factor_cols[1]:
-                st.markdown("**Signals lowering the estimate**")
-                st.write("\n".join(f"• {format_feature_name(name)}" for _, name in decreases) if decreases else "No strong downward signal among entered fields.")
-            st.caption("Contributions are one-field comparisons to training-set typical values; they are associations, not causes.")
+                st.markdown("**Factors associated with a lower estimate**")
+                st.markdown("\n".join(describe_factor(item) for item in decreases) if decreases else "No strong downward signal among entered fields.")
+            st.caption("Showing up to five one-field comparisons per direction. These model associations are not causes, and their effects are not additive.")
     return risk, features
 
 
@@ -280,10 +311,28 @@ elif page == "Historical records":
     records = historical.sort_values("risk_probability", ascending=False).reset_index(drop=True)
     table = records.copy()
     table.insert(0,"Record",np.arange(1,len(table)+1))
-    table["actual_readmitted_within_30_days"] = table["actual_readmitted_within_30_days"].map({1:"Yes",0:"No"})
+    diagnosis = records.get("diag_1", pd.Series("Unknown", index=records.index))
+    table["Primary diagnosis group"] = diagnosis.map(
+        lambda value: {
+            "Endocrine_metabolic": "Endocrine / metabolic",
+            "Nervous_sense_organs": "Nervous system / senses",
+            "Symptoms_signs": "Symptoms / signs",
+            "Injury_poisoning": "Injury / poisoning",
+            "V_codes": "V codes",
+            "E_codes": "E codes",
+        }.get(icd9_chapter(value), icd9_chapter(value).replace("_", " "))
+    )
     table["risk_probability"] = table.risk_probability.map(lambda value:f"{value:.1%}")
-    table = table.rename(columns={"age":"Age band","gender":"Gender","admission_type_id":"Admission type","actual_readmitted_within_30_days":"Actual outcome","risk_probability":"Estimated risk"})
-    columns = [name for name in ["Record","risk_category","Age band","Gender","Admission type","Actual outcome","Estimated risk"] if name in table]
+    table = table.rename(columns={
+        "age":"Age band", "gender":"Gender", "admission_type_id":"Admission type",
+        "time_in_hospital":"Hospital days", "number_inpatient":"Prior inpatient visits",
+        "number_emergency":"Prior emergency visits",
+        "risk_probability":"Estimated risk",
+    })
+    columns = [name for name in [
+        "Record", "risk_category", "Age band", "Gender", "Admission type", "Primary diagnosis group",
+        "Hospital days", "Prior inpatient visits", "Prior emergency visits", "Estimated risk",
+    ] if name in table]
     table = table.rename(columns={"risk_category":"Risk level"})
     columns = ["Risk level" if name == "risk_category" else name for name in columns]
     row_event = st.dataframe(table[columns], width="stretch", hide_index=True, height=380, on_select="rerun", selection_mode="single-row", key="historical_records_compact_v1")
@@ -291,6 +340,31 @@ elif page == "Historical records":
     if chosen:
         record = records.iloc[chosen[0]]
         st.markdown(f"### Record {chosen[0]+1} · {record.age} · {record.gender} · {record.race}")
+        raw_diagnosis = format_feature_value(record.get("diag_1", "Unknown"))
+        diagnosis_group = icd9_chapter(raw_diagnosis).replace("_", " ")
+        if diagnosis_group == "Unknown":
+            diagnosis_group = "Unknown / missing"
+        encounter_factors = [
+            ("Primary diagnosis (ICD-9)", f"{raw_diagnosis} · {diagnosis_group}"),
+            ("Hospital days", format_feature_value(record.get("time_in_hospital"))),
+            ("Prior inpatient visits", format_feature_value(record.get("number_inpatient"))),
+            ("Prior emergency visits", format_feature_value(record.get("number_emergency"))),
+            ("Prior outpatient visits", format_feature_value(record.get("number_outpatient"))),
+            ("Number of diagnoses", format_feature_value(record.get("number_diagnoses"))),
+            ("Number of medications", format_feature_value(record.get("num_medications"))),
+            ("A1C result", format_feature_value(record.get("a1cresult"))),
+            ("Insulin treatment", format_feature_value(record.get("insulin"))),
+            ("Diabetes medication", format_feature_value(record.get("diabetesmed"))),
+            ("Medication change", format_feature_value(record.get("change"))),
+            ("Lab procedures", format_feature_value(record.get("num_lab_procedures"))),
+        ]
+        with st.container(border=True):
+            st.markdown("#### Encounter factors")
+            st.caption("More of the recorded encounter details used by the historical model.")
+            for start in range(0, len(encounter_factors), 4):
+                factor_cols = st.columns(4)
+                for col, (label, value) in zip(factor_cols, encounter_factors[start:start + 4]):
+                    col.metric(label, value)
         explain_estimate(record.to_dict(),"historical")
         render_fairness(record.to_dict(),"historical")
 
