@@ -87,6 +87,16 @@ def _choose_threshold(y_true, probabilities, beta: float):
     return best[2]
 
 
+def _choose_previous_f1_threshold(y_true, probabilities):
+    """Match the earlier model's 0.01-grid F1 threshold search."""
+    candidates = np.linspace(0.02, 0.98, 97)
+    scored = []
+    for threshold in candidates:
+        pred = (probabilities >= threshold).astype("int8")
+        scored.append((f1_score(y_true, pred, zero_division=0), -abs(float(threshold) - 0.5), float(threshold)))
+    return max(scored)[2]
+
+
 def _baseline(X: pd.DataFrame, indices) -> dict:
     result = {}
     for column in X.columns:
@@ -99,13 +109,17 @@ def _baseline(X: pd.DataFrame, indices) -> dict:
     return result
 
 
-def _fit_candidates(X, y, fit_idx, val_idx):
-    estimators = {
+def _fit_candidates(X, y, fit_idx, val_idx, model_profile: str = "previous"):
+    candidates = {
         "Logistic Regression (balanced)": LogisticRegression(max_iter=1800, class_weight="balanced", solver="liblinear", C=0.5, random_state=42),
         "Logistic Regression": LogisticRegression(max_iter=1800, solver="liblinear", C=0.5, random_state=42),
         "Random Forest": RandomForestClassifier(n_estimators=100, min_samples_leaf=8, max_features="sqrt", class_weight="balanced_subsample", n_jobs=-1, random_state=42),
         "Gradient Boosting": GradientBoostingClassifier(n_estimators=70, learning_rate=0.05, max_depth=2, min_samples_leaf=30, subsample=0.8, random_state=42),
     }
+    estimators = (
+        {"Logistic Regression (balanced)": candidates["Logistic Regression (balanced)"]}
+        if model_profile == "previous" else candidates
+    )
     models, reports = {}, {}
     for name, estimator in estimators.items():
         print(f"Fitting {name} on {len(fit_idx):,} development rows...", flush=True)
@@ -114,13 +128,15 @@ def _fit_candidates(X, y, fit_idx, val_idx):
         probability = candidate.predict_proba(X.iloc[val_idx])[:, 1]
         reports[name] = score_metrics(y[val_idx], (probability >= 0.5).astype("int8"), probability)
         models[name] = candidate
-    # Average precision is more informative than ROC-AUC with the roughly
-    # 11% positive class. AUC remains available for comparison.
-    winner = max(reports, key=lambda name: (reports[name]["average_precision"], reports[name]["auc"] or -1))
+    # The previous demo used balanced Logistic Regression. Keep that as the
+    # default restored profile; optional comparison mode retains AP selection.
+    winner = next(iter(reports)) if model_profile == "previous" else max(
+        reports, key=lambda name: (reports[name]["average_precision"], reports[name]["auc"] or -1)
+    )
     return estimators, models, reports, winner
 
 
-def train(data_path: Path, out: Path, mapping_path: Path | None = None, test_size: float = 0.2):
+def train(data_path: Path, out: Path, mapping_path: Path | None = None, test_size: float = 0.2, model_profile: str = "previous"):
     if not data_path.exists():
         raise FileNotFoundError(f"Dataset not found: {data_path}")
     raw = pd.read_csv(data_path, low_memory=False)
@@ -140,9 +156,13 @@ def train(data_path: Path, out: Path, mapping_path: Path | None = None, test_siz
     if np.intersect1d(groups[fit_idx], groups[val_idx]).size or np.intersect1d(groups[val_idx], groups[test_idx]).size:
         raise AssertionError("Patient-level validation split contains overlapping patients.")
 
-    full_estimators, full_models, full_validation, full_winner = _fit_candidates(X, y, fit_idx, val_idx)
+    full_estimators, full_models, full_validation, full_winner = _fit_candidates(X, y, fit_idx, val_idx, model_profile)
     full_validation_probability = full_models[full_winner].predict_proba(X.iloc[val_idx])[:, 1]
-    full_threshold_f1 = _choose_threshold(y[val_idx], full_validation_probability, beta=1.0)
+    full_threshold_f1 = (
+        _choose_previous_f1_threshold(y[val_idx], full_validation_probability)
+        if model_profile == "previous"
+        else _choose_threshold(y[val_idx], full_validation_probability, beta=1.0)
+    )
     full_threshold_f2 = _choose_threshold(y[val_idx], full_validation_probability, beta=2.0)
 
     compact_columns = [column for column in COMPACT_FEATURES if column in X.columns]
@@ -150,9 +170,13 @@ def train(data_path: Path, out: Path, mapping_path: Path | None = None, test_siz
         missing = sorted(set(COMPACT_FEATURES) - set(compact_columns))
         raise ValueError(f"Compact-form training fields missing from source dataset: {missing}")
     compact_X = X[compact_columns]
-    compact_estimators, compact_models, compact_validation, compact_winner = _fit_candidates(compact_X, y, fit_idx, val_idx)
+    compact_estimators, compact_models, compact_validation, compact_winner = _fit_candidates(compact_X, y, fit_idx, val_idx, model_profile)
     compact_validation_probability = compact_models[compact_winner].predict_proba(compact_X.iloc[val_idx])[:, 1]
-    compact_threshold_f1 = _choose_threshold(y[val_idx], compact_validation_probability, beta=1.0)
+    compact_threshold_f1 = (
+        _choose_previous_f1_threshold(y[val_idx], compact_validation_probability)
+        if model_profile == "previous"
+        else _choose_threshold(y[val_idx], compact_validation_probability, beta=1.0)
+    )
     compact_threshold_f2 = _choose_threshold(y[val_idx], compact_validation_probability, beta=2.0)
 
     # Refit only the selected model for each use case on development data.
@@ -161,11 +185,13 @@ def train(data_path: Path, out: Path, mapping_path: Path | None = None, test_siz
     compact_pipeline = Pipeline([("preprocess", build_preprocessor(compact_X.iloc[dev_idx])), ("model", clone(compact_estimators[compact_winner]))])
     compact_pipeline.fit(compact_X.iloc[dev_idx], y[dev_idx])
 
+    active_full_threshold = full_threshold_f1 if model_profile == "previous" else full_threshold_f2
+    active_compact_threshold = compact_threshold_f1 if model_profile == "previous" else compact_threshold_f2
     full_probability = full_pipeline.predict_proba(X.iloc[test_idx])[:, 1]
-    full_prediction = (full_probability >= full_threshold_f2).astype("int8")
+    full_prediction = (full_probability >= active_full_threshold).astype("int8")
     full_prediction_f1 = (full_probability >= full_threshold_f1).astype("int8")
     compact_probability = compact_pipeline.predict_proba(compact_X.iloc[test_idx])[:, 1]
-    compact_prediction = (compact_probability >= compact_threshold_f2).astype("int8")
+    compact_prediction = (compact_probability >= active_compact_threshold).astype("int8")
     compact_prediction_f1 = (compact_probability >= compact_threshold_f1).astype("int8")
     full_test_metrics = score_metrics(y[test_idx], full_prediction, full_probability)
     full_test_metrics_f1 = score_metrics(y[test_idx], full_prediction_f1, full_probability)
@@ -181,14 +207,14 @@ def train(data_path: Path, out: Path, mapping_path: Path | None = None, test_siz
         "pipeline": full_pipeline,
         "model_name": full_winner,
         "feature_columns": X.columns.tolist(),
-        "threshold": full_threshold_f2,
+        "threshold": active_full_threshold,
         "threshold_f1": full_threshold_f1,
         "mappings": mappings,
         "explanation_baseline": _baseline(X, dev_idx),
         "compact_pipeline": compact_pipeline,
         "compact_model_name": compact_winner,
         "compact_feature_columns": compact_columns,
-        "compact_threshold": compact_threshold_f2,
+        "compact_threshold": active_compact_threshold,
         "compact_threshold_f1": compact_threshold_f1,
         "compact_explanation_baseline": _baseline(compact_X, dev_idx),
     }
@@ -199,10 +225,13 @@ def train(data_path: Path, out: Path, mapping_path: Path | None = None, test_siz
         "selected_model": full_winner,
         "target": "readmitted (<30=1; NO and >30=0)",
         "split": "Patient-disjoint development/validation/test via GroupShuffleSplit",
-        "model_selection": "Validation average precision; ROC-AUC reported too",
-        "threshold_selection": "Validation F2 (recall-weighted); F1 alternative also reported; test set not used for tuning",
-        "decision_threshold": float(full_threshold_f2),
+        "model_selection": ("Previous demo profile: balanced Logistic Regression" if model_profile == "previous" else "Validation average precision; ROC-AUC reported too"),
+        "threshold_selection": ("Validation F1 (previous balanced Logistic Regression profile); test set not used for tuning" if model_profile == "previous" else "Validation F2 (recall-weighted); F1 alternative also reported; test set not used for tuning"),
+        "active_model_profile": model_profile,
+        "active_threshold_objective": "F1" if model_profile == "previous" else "F2",
+        "decision_threshold": float(active_full_threshold),
         "decision_threshold_f1_alternative": float(full_threshold_f1),
+        "decision_threshold_f2_alternative": float(full_threshold_f2),
         "development_rows": int(len(dev_idx)),
         "validation_rows": int(len(val_idx)),
         "test_rows": int(len(test_idx)),
@@ -218,8 +247,10 @@ def train(data_path: Path, out: Path, mapping_path: Path | None = None, test_siz
         "compact_form_model": {
             "selected_model": compact_winner,
             "features": compact_columns,
-            "decision_threshold": float(compact_threshold_f2),
+            "decision_threshold": float(active_compact_threshold),
+            "threshold_objective": "F1" if model_profile == "previous" else "F2",
             "decision_threshold_f1_alternative": float(compact_threshold_f1),
+            "decision_threshold_f2_alternative": float(compact_threshold_f2),
             "validation_metrics_at_0_5": compact_validation,
             "selected_test_metrics": compact_test_metrics,
             "selected_test_metrics_at_f1_threshold": compact_test_metrics_f1,
@@ -275,9 +306,11 @@ def main():
     parser.add_argument("--data", type=Path, default=project_root / "data" / "diabetic_data.csv")
     parser.add_argument("--mapping", type=Path, default=project_root / "data" / "IDS_mapping.csv")
     parser.add_argument("--out", type=Path, default=project_root / "artifacts")
+    parser.add_argument("--model-profile", choices=["previous", "compare"], default="previous",
+                        help="Use the earlier balanced Logistic Regression as primary (default), or compare/select candidates by validation average precision.")
     args = parser.parse_args()
     try:
-        print(json.dumps(train(args.data, args.out, args.mapping if args.mapping.exists() else None), indent=2))
+        print(json.dumps(train(args.data, args.out, args.mapping if args.mapping.exists() else None, model_profile=args.model_profile), indent=2))
     except (FileNotFoundError, ValueError) as exc:
         parser.error(str(exc))
 

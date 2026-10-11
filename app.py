@@ -7,7 +7,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from medvision.pipeline import prepare_features
+from medvision.pipeline import prepare_features, icd9_chapter
 
 ROOT = Path(__file__).parent
 ARTIFACTS = ROOT / "artifacts"
@@ -68,6 +68,12 @@ mappings = bundle.get("mappings", {})
 baseline = bundle.get("explanation_baseline", {})
 threshold = float(bundle.get("threshold", 0.5))
 metrics = json.loads((ARTIFACTS / "metrics.json").read_text(encoding="utf-8"))
+if metrics.get("active_model_profile") != "previous":
+    st.warning(
+        f"The saved artifact is still {metrics.get('selected_model', 'an older model')}. "
+        "The trainer now defaults to the previous balanced Logistic Regression model. "
+        "Run `python train.py --model-profile previous` before presenting to refresh the model and metrics."
+    )
 historical = pd.read_csv(ARTIFACTS / "historical_predictions.csv")
 compact_history_path = ARTIFACTS / "compact_historical_predictions.csv"
 compact_historical = pd.read_csv(compact_history_path) if compact_history_path.exists() else historical.copy()
@@ -184,7 +190,7 @@ def explain_estimate(raw_record, input_name: str, model=None, columns=None, typi
     return risk, features
 
 
-page = st.radio("Main menu", ["Home", "Historical records", "New data input"], horizontal=True, label_visibility="collapsed", key="dashboard_page")
+page = st.radio("Main menu", ["Home", "Historical records", "Care planning", "New data input"], horizontal=True, label_visibility="collapsed", key="dashboard_page")
 
 if page == "Home":
     st.subheader("Model breakthrough results")
@@ -203,12 +209,12 @@ if page == "Home":
     target_col.caption(f"{metrics['test_positive_rate']:.1%} of holdout encounters")
     baseline_col.markdown("**Always-negative accuracy**")
     baseline_col.caption(f"{metrics['test_majority_baseline_accuracy']:.1%} · accuracy alone can hide missed cases")
-    target_note.caption(f"Model selection used validation average precision; the displayed decision cutoff was selected on validation using F2 to weight recall. Holdout patients were not used for tuning.")
+    target_note.caption(f"{metrics.get('model_selection', 'Model selection used validation data')}. {metrics.get('threshold_selection', 'The threshold was selected using validation data')}. Holdout patients were not used for tuning.")
     f1_tradeoff = metrics.get("selected_test_metrics_at_f1_threshold")
-    if f1_tradeoff:
+    if f1_tradeoff and metrics.get("active_threshold_objective") != "F1":
         st.caption(f"Threshold trade-off on the same holdout (F1-selected validation cutoff {metrics['decision_threshold_f1_alternative']:.2f}): precision {f1_tradeoff['precision']:.1%}, recall {f1_tradeoff['recall']:.1%}, accuracy {f1_tradeoff['accuracy']:.1%}. The active F2 cutoff favors finding more positive cases and creates more false alerts.")
 
-    st.subheader("Model comparison")
+    st.subheader("Active model validation snapshot" if metrics.get("active_model_profile") == "previous" else "Model comparison")
     comparison = metrics["validation_metrics_at_0_5"]
     names = list(comparison)
     compare = go.Figure()
@@ -226,7 +232,7 @@ if page == "Home":
         compact_metrics = compact_result["selected_test_metrics"]
         with st.container(border=True):
             st.markdown("**New data form model · patient-level holdout**")
-            st.caption(f"{compact_result['selected_model']} · trained on the {len(compact_result['features'])} fields in the form · validation F2 cutoff {compact_result['decision_threshold']:.2f}")
+            st.caption(f"{compact_result['selected_model']} · trained on the {len(compact_result['features'])} fields in the form · validation {compact_result.get('threshold_objective', 'F2')} cutoff {compact_result['decision_threshold']:.2f}")
             st.write(f"Recall **{compact_metrics['recall']:.1%}** · precision **{compact_metrics['precision']:.1%}** · average precision **{compact_metrics['average_precision']:.3f}** · ROC-AUC **{compact_metrics['auc']:.3f}**")
 
     st.subheader("Holdout distribution")
@@ -287,6 +293,165 @@ elif page == "Historical records":
         st.markdown(f"### Record {chosen[0]+1} · {record.age} · {record.gender} · {record.race}")
         explain_estimate(record.to_dict(),"historical")
         render_fairness(record.to_dict(),"historical")
+
+
+elif page == "Care planning":
+    st.subheader("Higher-risk care planning context")
+    st.caption(
+        "Explore recorded diagnosis and diabetes-treatment patterns among historical encounters in the Higher display band. "
+        "This is group-level context for review, not an individual care recommendation."
+    )
+
+    high_risk = historical.loc[historical["risk_category"].eq("Higher")].copy()
+    if high_risk.empty:
+        st.info("There are no encounters in the Higher display band in the current historical holdout.")
+    else:
+        high_risk["primary_diagnosis_group"] = high_risk.get(
+            "diag_1", pd.Series("Unknown", index=high_risk.index)
+        ).map(icd9_chapter)
+        diagnosis_names = {
+            "Infectious": "Infectious diseases",
+            "Neoplasms": "Neoplasms",
+            "Endocrine_metabolic": "Endocrine / metabolic",
+            "Blood": "Blood disorders",
+            "Mental": "Mental disorders",
+            "Nervous_sense_organs": "Nervous system / senses",
+            "Circulatory": "Circulatory system",
+            "Respiratory": "Respiratory system",
+            "Digestive": "Digestive system",
+            "Genitourinary": "Genitourinary system",
+            "Pregnancy": "Pregnancy-related",
+            "Skin": "Skin disorders",
+            "Musculoskeletal": "Musculoskeletal",
+            "Congenital": "Congenital conditions",
+            "Perinatal": "Perinatal conditions",
+            "Symptoms_signs": "Symptoms / signs",
+            "Injury_poisoning": "Injury / poisoning",
+            "V_codes": "V codes / encounters",
+            "E_codes": "E codes / external causes",
+            "Unknown": "Unknown / missing",
+        }
+        high_risk["primary_diagnosis_group"] = high_risk["primary_diagnosis_group"].map(
+            lambda value: diagnosis_names.get(str(value), str(value))
+        )
+
+        def care_category(series, replacements):
+            return (
+                series.fillna("Unknown")
+                .astype(str)
+                .str.strip()
+                .replace({"?": "Unknown", "": "Unknown", "nan": "Unknown"})
+                .replace(replacements)
+            )
+
+        high_risk["diabetesmed"] = care_category(
+            high_risk.get("diabetesmed", pd.Series("Unknown", index=high_risk.index)),
+            {"Yes": "Medication recorded", "No": "No diabetes medication recorded"},
+        )
+        high_risk["insulin"] = care_category(
+            high_risk.get("insulin", pd.Series("Unknown", index=high_risk.index)),
+            {"No": "No insulin recorded", "Steady": "Insulin dose steady",
+             "Up": "Insulin dose increased", "Down": "Insulin dose decreased"},
+        )
+        high_risk["change"] = care_category(
+            high_risk.get("change", pd.Series("Unknown", index=high_risk.index)),
+            {"Ch": "Medication changed", "No": "No change recorded"},
+        )
+        high_risk["a1cresult"] = care_category(
+            high_risk.get("a1cresult", pd.Series("Unknown", index=high_risk.index)),
+            {"Norm": "Normal", ">7": "Above 7", ">8": "Above 8"},
+        )
+
+        metric_cols = st.columns(4)
+        metric_cols[0].metric("Higher-band encounters", f"{len(high_risk):,}")
+        metric_cols[1].metric(
+            "Observed <30-day readmission",
+            f"{high_risk['actual_readmitted_within_30_days'].mean():.1%}",
+            help="Observed rate in this historical holdout cohort; not a future outcome for a new patient.",
+        )
+        med_recorded = high_risk["diabetesmed"].eq("Medication recorded").mean()
+        metric_cols[2].metric("Diabetes medication recorded", f"{med_recorded:.1%}")
+        metric_cols[3].metric(
+            "Follow-up / facility need",
+            "Not captured",
+            help="The source data does not record discharge-plan adherence or required facility placement.",
+        )
+
+        st.markdown("#### Treatment and medication profile by diagnosis group")
+        treatment_options = {
+            "Diabetes medication": "diabetesmed",
+            "Insulin treatment": "insulin",
+            "Medication change": "change",
+            "A1C result": "a1cresult",
+        }
+        selected_label = st.selectbox(
+            "Break down higher-risk encounters by",
+            list(treatment_options),
+            key="care_planning_treatment_view",
+        )
+        selected_field = treatment_options[selected_label]
+        grouped = (
+            high_risk.groupby(["primary_diagnosis_group", selected_field], dropna=False)
+            .agg(
+                encounters=("risk_probability", "size"),
+                observed_rate=("actual_readmitted_within_30_days", "mean"),
+                average_risk=("risk_probability", "mean"),
+                average_medications=("num_medications", "mean"),
+            )
+            .reset_index()
+        )
+        diagnosis_order = (
+            grouped.groupby("primary_diagnosis_group")["encounters"]
+            .sum().sort_values(ascending=True).index.tolist()
+        )
+        treatment_order = grouped[selected_field].value_counts().index.tolist()
+        figure = go.Figure()
+        for treatment in treatment_order:
+            part = grouped[grouped[selected_field] == treatment].copy()
+            part["primary_diagnosis_group"] = pd.Categorical(
+                part["primary_diagnosis_group"], categories=diagnosis_order, ordered=True
+            )
+            part = part.sort_values("primary_diagnosis_group")
+            custom = np.column_stack([
+                part["observed_rate"].to_numpy(),
+                part["average_risk"].to_numpy(),
+                part["average_medications"].to_numpy(),
+            ])
+            figure.add_trace(go.Bar(
+                y=part["primary_diagnosis_group"].astype(str),
+                x=part["encounters"],
+                name=str(treatment),
+                orientation="h",
+                customdata=custom,
+                hovertemplate=(
+                    "%{y}<br>%{fullData.name}<br>Higher-band encounters: %{x:,}"
+                    "<br>Observed under-30-day readmission: %{customdata[0]:.1%}"
+                    "<br>Average model risk: %{customdata[1]:.1%}"
+                    "<br>Average medication count: %{customdata[2]:.1f}<extra></extra>"
+                ),
+            ))
+        figure.update_layout(
+            template="plotly_white",
+            barmode="stack",
+            height=max(430, 28 * len(diagnosis_order) + 150),
+            margin={"l": 12, "r": 18, "t": 20, "b": 30},
+            xaxis={"title": "Higher-band encounters", "gridcolor": "#e2ece5"},
+            yaxis={"title": "Primary diagnosis group (ICD-9 chapter)", "automargin": True},
+            legend={"title": selected_label, "orientation": "h", "y": 1.08},
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            font={"family": "Segoe UI", "color": "#18372c"},
+        )
+        st.plotly_chart(figure, width="stretch", config={"displayModeBar": False})
+        st.caption(
+            "Bar length is the number of historical encounters in the Higher display band. Hover for observed readmission rate, "
+            "average model risk, and average medication count. Diagnosis groups are broad ICD-9 chapters, not specific diagnoses."
+        )
+        st.info(
+            "The dataset records medication use/change and some diabetes-treatment indicators, but it does not say whether a "
+            "patient followed a follow-up plan, what plan was prescribed, or whether a facility was required. Use this chart to "
+            "identify cohorts for human review; it does not prescribe starting, stopping, or changing treatment."
+        )
 
 else:
     st.subheader("New encounter")

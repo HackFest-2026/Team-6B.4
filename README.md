@@ -16,7 +16,7 @@ Run these commands from the MEDVISION project folder:
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
-python train.py
+python train.py --model-profile previous
 streamlit run app.py
 ```
 
@@ -24,7 +24,7 @@ If PowerShell blocks virtual-environment activation, use the Python executable d
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe train.py
+.\.venv\Scripts\python.exe train.py --model-profile previous
 .\.venv\Scripts\python.exe -m streamlit run app.py
 ```
 
@@ -37,28 +37,22 @@ python train.py --data "C:\path\to\diabetic_data.csv" --mapping "C:\path\to\IDS_
 ## Training workflow
 
 - Target: `<30` is positive (`1`); `NO` and `>30` are negative (`0`).
-- Identifiers are excluded from model features. Patients are grouped by `patient_nbr` for a 20% untouched test split. The remaining development data is split again into a training portion and an internal validation portion for candidate selection and threshold selection. Preprocessing is fit on training data only; the chosen model is refit on development data before final test evaluation.
-- Candidate models: balanced and unbalanced Logistic Regression, Random Forest, and Gradient Boosting. Selection uses validation average precision, which is useful for this imbalanced target; ROC-AUC is also reported.
-- The default decision threshold is selected on validation using F2 to put more weight on recall. An F1-selected threshold is also reported to show the precision/recall trade-off. The test set is not used to choose the model or either threshold.
-- Diagnosis fields are transformed into broad ICD-9 chapters. The source dataset uses ICD-9 diagnosis codes. Weight, maximum glucose, constant medication fields, and discharge disposition are excluded from the primary model; discharge disposition is known after the prediction point and could leak outcome-related information.
-- A separate compact model is trained on only the 13 fields entered in the new-data form. It does not score a form submission by filling the full model's omitted features with defaults.
+- The default `previous` profile restores the earlier balanced Logistic Regression configuration (`class_weight="balanced"`, `C=0.5`, `liblinear`) and its validation-selected F1 cutoff. This is the intended demo model.
+- A 20% patient-disjoint test set is kept untouched. The remaining development records are split into training and validation groups by `patient_nbr`; preprocessing is fit on training data only, and the final estimators are refit on development data before test evaluation.
+- `--model-profile compare` enables the later candidate comparison (balanced/unbalanced Logistic Regression, Random Forest, and Gradient Boosting) with validation average-precision selection and recall-focused F2 thresholding.
+- Diagnosis fields are transformed into broad ICD-9 chapters. Weight, maximum glucose, constant medication fields, and discharge disposition are excluded from the primary model; discharge disposition is known after the prediction point and could leak outcome-related information.
+- A separate balanced Logistic Regression is trained on only the 13 fields in the new-data form. The form model does not fill omitted inputs with made-up defaults.
+- Training regenerates `artifacts/medvision_pipeline.joblib` and the metrics/prediction files. Because artifacts are ignored by Git, run this command after cloning or changing the model profile:
 
-## Latest holdout results
+```powershell
+python train.py --model-profile previous
+```
 
-These results are from the saved run in `artifacts/metrics.json`. Positive cases make up 11.6% of the test encounters, so an always-negative classifier already has 88.4% accuracy while detecting no readmissions. Accuracy should not be interpreted on its own.
-
-| Model and cutoff | Accuracy | Precision | Recall | F1 | ROC-AUC | Average precision |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Full-feature model, recall-focused F2 | 35.7% | 13.4% | 83.4% | 23.1% | 0.635 | 0.210 |
-| Full-feature model, F1 alternative | 76.4% | 20.2% | 35.6% | 25.8% | 0.635 | 0.210 |
-| Compact form model, recall-focused F2 | 30.6% | 12.9% | 86.9% | 22.4% | 0.633 | 0.209 |
-| Compact form model, F1 alternative | 78.5% | 21.3% | 31.8% | 25.5% | 0.633 | 0.209 |
-
-The recall-focused cutoff finds more positive cases but flags many encounters that are not readmitted. The F1 alternative reduces false alerts but misses more positive cases. The current results do not support claiming 90% useful predictive accuracy; the high accuracy of an always-negative baseline comes from class imbalance, not readmission detection.
+The previously reported full-model reference results for this demo version were accuracy 68.9%, precision 18.0%, recall 47.4%, F1 26.1%, and ROC-AUC 0.643 at a cutoff around 0.52. The regenerated scores are written to `artifacts/metrics.json`; use those values if they differ. The positive class is only about 11%, so an always-negative classifier can have high accuracy while detecting no readmissions. Accuracy alone is not a useful success claim.
 
 ## Dashboard
 
-- **Home:** holdout model metrics, candidate comparison, and interactive outcome/medication distributions.
+- **Home:** holdout model metrics, active-model validation snapshot, and interactive outcome/medication distributions.
 - **Historical records:** held-out records with known outcomes, risk estimates, explanations, and age, gender, and race context.
 - **New data input:** compact 13-field form scored by its dedicated model. The outcome is unknown; fairness cards show aggregate results for similar demographic groups in the compact model's historical holdout, not an outcome for the submitted encounter.
 
@@ -66,4 +60,4 @@ Training writes model pipelines, metrics, held-out predictions, and fairness sum
 
 ## Limitations
 
-This is an educational analytics prototype, not a clinical decision system. Holdout discrimination is modest, and the recall-oriented cutoff has low precision. Fairness results are descriptive subgroup comparisons and should be interpreted with group sizes and dataset limitations in mind.
+This is an educational analytics prototype, not a clinical decision system. Holdout discrimination is modest and precision is limited. Fairness results are descriptive subgroup comparisons and should be interpreted with group sizes and dataset limitations in mind.
